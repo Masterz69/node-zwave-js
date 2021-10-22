@@ -318,6 +318,12 @@ interface RequestHandlerEntry<T extends Message = Message> {
 	oneTime: boolean;
 }
 
+interface AwaitedMessageEntry {
+	promise: DeferredPromise<Message>;
+	timeout?: NodeJS.Timeout;
+	predicate: (msg: Message) => boolean;
+}
+
 interface AwaitedCommandEntry {
 	promise: DeferredPromise<CommandClass>;
 	timeout?: NodeJS.Timeout;
@@ -411,6 +417,8 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 
 	/** A map of handlers for all sorts of requests */
 	private requestHandlers = new Map<FunctionType, RequestHandlerEntry[]>();
+	/** A map of awaited messages */
+	private awaitedMessages: AwaitedMessageEntry[] = [];
 	/** A map of awaited commands */
 	private awaitedCommands: AwaitedCommandEntry[] = [];
 
@@ -1709,6 +1717,8 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 		// First stop the send thread machine and close the serial port, so nothing happens anymore
 		if (this.sendThread.initialized) this.sendThread.stop();
 		if (this.serial != undefined) {
+			// Avoid spewing errors if the port was in the middle of receiving something
+			this.serial.removeAllListeners();
 			if (this.serial.isOpen) await this.serial.close();
 			this.serial = undefined;
 		}
@@ -1828,7 +1838,11 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 								// If it was, we need to notify the sender that we couldn't decode the command
 								await msg
 									.getNodeUnsafe()
-									?.commandClasses.Supervision.sendReport({
+									?.createAPI(
+										CommandClasses.Supervision,
+										false,
+									)
+									.sendReport({
 										sessionId: supervisionSessionId,
 										moreUpdatesFollow: false,
 										status: SupervisionStatus.NoSupport,
@@ -2610,16 +2624,8 @@ ${handlers.length} left`,
 				);
 				const secure = msg.command.secure;
 
-				if (
-					supervisionSessionId !== undefined &&
-					!node.supportsCC(CommandClasses.Supervision)
-				) {
-					// When a node sends us a command that's supervision encapsulated, it must support Supervision CC
-					node.addCC(CommandClasses.Supervision, {
-						isSupported: true,
-						version: 1,
-					});
-				}
+				// DO NOT force-add support for the Supervision CC here. Some devices only support Supervision when sending,
+				// so we need to trust the information we already have.
 
 				// check if someone is waiting for this command
 				for (const entry of this.awaitedCommands) {
@@ -2629,12 +2635,14 @@ ${handlers.length} left`,
 
 						// send back a Supervision Report if the command was received via Supervision Get
 						if (supervisionSessionId !== undefined) {
-							await node.commandClasses.Supervision.sendReport({
-								sessionId: supervisionSessionId,
-								moreUpdatesFollow: false,
-								status: SupervisionStatus.Success,
-								secure,
-							});
+							await node
+								.createAPI(CommandClasses.Supervision, false)
+								.sendReport({
+									sessionId: supervisionSessionId,
+									moreUpdatesFollow: false,
+									status: SupervisionStatus.Success,
+									secure,
+								});
 						}
 						return;
 					}
@@ -2646,19 +2654,23 @@ ${handlers.length} left`,
 					try {
 						await node.handleCommand(msg.command);
 
-						await node.commandClasses.Supervision.sendReport({
-							sessionId: supervisionSessionId,
-							moreUpdatesFollow: false,
-							status: SupervisionStatus.Success,
-							secure,
-						});
+						await node
+							.createAPI(CommandClasses.Supervision, false)
+							.sendReport({
+								sessionId: supervisionSessionId,
+								moreUpdatesFollow: false,
+								status: SupervisionStatus.Success,
+								secure,
+							});
 					} catch (e) {
-						await node.commandClasses.Supervision.sendReport({
-							sessionId: supervisionSessionId,
-							moreUpdatesFollow: false,
-							status: SupervisionStatus.Fail,
-							secure,
-						});
+						await node
+							.createAPI(CommandClasses.Supervision, false)
+							.sendReport({
+								sessionId: supervisionSessionId,
+								moreUpdatesFollow: false,
+								status: SupervisionStatus.Fail,
+								secure,
+							});
 
 						// In any case we don't want to swallow the error
 						throw e;
@@ -2694,6 +2706,17 @@ ${handlers.length} left`,
 				}
 			}
 		} else {
+			// Check if we have a dynamic handler waiting for this message
+			for (const entry of this.awaitedMessages) {
+				if (entry.predicate(msg)) {
+					// resolve the promise - this will remove the entry from the list
+					entry.promise.resolve(msg);
+					return;
+				}
+			}
+
+			// Otherwise loop through the static handlers
+
 			// TODO: This deserves a nicer formatting
 			this.driverLog.print(
 				`handling request ${FunctionType[msg.functionType]} (${
@@ -3153,7 +3176,48 @@ ${handlers.length} left`,
 	}
 
 	/**
-	 * Waits until a command is received or a timeout has elapsed. Returns the received command.
+	 * Waits until an unsolicited serial message is received or a timeout has elapsed. Returns the received message.
+	 *
+	 * **Note:** This does not trigger for [Bridge]ApplicationUpdateRequests, which are handled differently. To wait for a certain CommandClass, use {@link waitForCommand}.
+	 * @param timeout The number of milliseconds to wait. If the timeout elapses, the returned promise will be rejected
+	 * @param predicate A predicate function to test all incoming messages
+	 */
+	public waitForMessage<T extends Message>(
+		predicate: (msg: Message) => boolean,
+		timeout: number,
+	): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const entry: AwaitedMessageEntry = {
+				predicate,
+				promise: createDeferredPromise<Message>(),
+				timeout: undefined,
+			};
+			this.awaitedMessages.push(entry);
+			const removeEntry = () => {
+				if (entry.timeout) clearTimeout(entry.timeout);
+				const index = this.awaitedMessages.indexOf(entry);
+				if (index !== -1) this.awaitedMessages.splice(index, 1);
+			};
+			// When the timeout elapses, remove the wait entry and reject the returned Promise
+			entry.timeout = setTimeout(() => {
+				removeEntry();
+				reject(
+					new ZWaveError(
+						`Received no matching message within the provided timeout!`,
+						ZWaveErrorCodes.Controller_Timeout,
+					),
+				);
+			}, timeout).unref();
+			// When the promise is resolved, remove the wait entry and resolve the returned Promise
+			void entry.promise.then((cc) => {
+				removeEntry();
+				resolve(cc as T);
+			});
+		});
+	}
+
+	/**
+	 * Waits until a CommandClass is received or a timeout has elapsed. Returns the received command.
 	 * @param timeout The number of milliseconds to wait. If the timeout elapses, the returned promise will be rejected
 	 * @param predicate A predicate function to test all incoming command classes
 	 */
