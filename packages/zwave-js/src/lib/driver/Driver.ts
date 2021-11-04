@@ -4,15 +4,18 @@ import { ConfigManager, externalConfigDir } from "@zwave-js/config";
 import {
 	CommandClasses,
 	deserializeCacheValue,
+	dskFromString,
 	Duration,
 	highResTimestamp,
 	isZWaveError,
 	LogConfig,
+	nwiHomeIdFromDSK,
 	SecurityClass,
 	securityClassIsS2,
 	SecurityManager,
 	SecurityManager2,
 	serializeCacheValue,
+	SPANState,
 	timespan,
 	ValueMetadata,
 	ZWaveError,
@@ -101,9 +104,12 @@ import { ApplicationCommandRequest } from "../controller/ApplicationCommandReque
 import {
 	ApplicationUpdateRequest,
 	ApplicationUpdateRequestNodeInfoReceived,
+	ApplicationUpdateRequestSmartStartHomeIDReceived,
 } from "../controller/ApplicationUpdateRequest";
 import { BridgeApplicationCommandRequest } from "../controller/BridgeApplicationCommandRequest";
 import { ZWaveController } from "../controller/Controller";
+import { GetControllerVersionRequest } from "../controller/GetControllerVersionMessages";
+import { InclusionState } from "../controller/Inclusion";
 import {
 	SendDataBridgeRequest,
 	SendDataMulticastBridgeRequest,
@@ -132,6 +138,7 @@ import { getDefaultPriority, Message } from "../message/Message";
 import { isNodeQuery } from "../node/INodeQuery";
 import type { ZWaveNode } from "../node/Node";
 import { InterviewStage, NodeStatus } from "../node/Types";
+import type { SerialAPIStartedRequest } from "../serialapi/misc/SerialAPIStartedRequest";
 import { reportMissingDeviceConfig } from "../telemetry/deviceConfig";
 import {
 	AppInfo,
@@ -182,6 +189,8 @@ const defaultOptions: ZWaveOptions = {
 		nonce: 5000,
 		sendDataCallback: 65000, // as defined in INS13954
 		refreshValue: 5000, // Default should handle most slow devices until we have a better solution
+		refreshValueAfterTransition: 1000, // To account for delays in the device
+		serialAPIStarted: 5000,
 	},
 	attempts: {
 		openSerialPort: 10,
@@ -246,6 +255,15 @@ function checkOptions(options: ZWaveOptions): void {
 	if (options.timeouts.sendDataCallback < 10000) {
 		throw new ZWaveError(
 			`The Send Data Callback timeout must be at least 10000 milliseconds!`,
+			ZWaveErrorCodes.Driver_InvalidOptions,
+		);
+	}
+	if (
+		options.timeouts.serialAPIStarted < 1000 ||
+		options.timeouts.serialAPIStarted > 30000
+	) {
+		throw new ZWaveError(
+			`The Serial API started timeout must be between 1000 and 30000 milliseconds!`,
 			ZWaveErrorCodes.Driver_InvalidOptions,
 		);
 	}
@@ -410,89 +428,6 @@ export type DriverEvents = Extract<keyof DriverEventCallbacks, string>;
  * instance or its associated nodes.
  */
 export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
-	/** The serial port instance */
-	private serial: ZWaveSerialPortBase | undefined;
-	/** An instance of the Send Thread state machine */
-	private sendThread: SendThreadInterpreter;
-
-	/** A map of handlers for all sorts of requests */
-	private requestHandlers = new Map<FunctionType, RequestHandlerEntry[]>();
-	/** A map of awaited messages */
-	private awaitedMessages: AwaitedMessageEntry[] = [];
-	/** A map of awaited commands */
-	private awaitedCommands: AwaitedCommandEntry[] = [];
-
-	/** A map of Node ID -> ongoing sessions */
-	private nodeSessions = new Map<number, Sessions>();
-	private ensureNodeSessions(nodeId: number): Sessions {
-		if (!this.nodeSessions.has(nodeId)) {
-			this.nodeSessions.set(nodeId, {
-				transportService: new Map(),
-				supervision: new Map(),
-			});
-		}
-		return this.nodeSessions.get(nodeId)!;
-	}
-
-	public readonly cacheDir: string;
-
-	private _valueDB: JsonlDB | undefined;
-	/** @internal */
-	public get valueDB(): JsonlDB | undefined {
-		return this._valueDB;
-	}
-	private _metadataDB: JsonlDB<ValueMetadata> | undefined;
-	/** @internal */
-	public get metadataDB(): JsonlDB<ValueMetadata> | undefined {
-		return this._metadataDB;
-	}
-
-	public readonly configManager: ConfigManager;
-	public get configVersion(): string {
-		return (
-			this.configManager?.configVersion ??
-			packageJson?.dependencies?.["@zwave-js/config"] ??
-			libVersion
-		);
-	}
-
-	private _logContainer: ZWaveLogContainer;
-	private _driverLog: DriverLogger;
-	/** @internal */
-	public get driverLog(): DriverLogger {
-		return this._driverLog;
-	}
-
-	private _controllerLog: ControllerLogger;
-	/** @internal */
-	public get controllerLog(): ControllerLogger {
-		return this._controllerLog;
-	}
-
-	private _controller: ZWaveController | undefined;
-	/** Encapsulates information about the Z-Wave controller and provides access to its nodes */
-	public get controller(): ZWaveController {
-		if (this._controller == undefined) {
-			throw new ZWaveError(
-				"The controller is not yet ready!",
-				ZWaveErrorCodes.Driver_NotReady,
-			);
-		}
-		return this._controller;
-	}
-
-	private _securityManager: SecurityManager | undefined;
-	/** @internal */
-	public get securityManager(): SecurityManager | undefined {
-		return this._securityManager;
-	}
-
-	private _securityManager2: SecurityManager2 | undefined;
-	/** @internal */
-	public get securityManager2(): SecurityManager2 | undefined {
-		return this._securityManager2;
-	}
-
 	public constructor(
 		private port: string,
 		options?: DeepPartial<ZWaveOptions>,
@@ -517,6 +452,8 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 
 		// Initialize the cache
 		this.cacheDir = this.options.storage.cacheDir;
+
+		// TODO: Load provisioning list
 
 		// Initialize config manager
 		this.configManager = new ConfigManager({
@@ -634,6 +571,88 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 		// 		);
 		// });
 	}
+	/** The serial port instance */
+	private serial: ZWaveSerialPortBase | undefined;
+	/** An instance of the Send Thread state machine */
+	private sendThread: SendThreadInterpreter;
+
+	/** A map of handlers for all sorts of requests */
+	private requestHandlers = new Map<FunctionType, RequestHandlerEntry[]>();
+	/** A map of awaited messages */
+	private awaitedMessages: AwaitedMessageEntry[] = [];
+	/** A map of awaited commands */
+	private awaitedCommands: AwaitedCommandEntry[] = [];
+
+	/** A map of Node ID -> ongoing sessions */
+	private nodeSessions = new Map<number, Sessions>();
+	private ensureNodeSessions(nodeId: number): Sessions {
+		if (!this.nodeSessions.has(nodeId)) {
+			this.nodeSessions.set(nodeId, {
+				transportService: new Map(),
+				supervision: new Map(),
+			});
+		}
+		return this.nodeSessions.get(nodeId)!;
+	}
+
+	public readonly cacheDir: string;
+
+	private _valueDB: JsonlDB | undefined;
+	/** @internal */
+	public get valueDB(): JsonlDB | undefined {
+		return this._valueDB;
+	}
+	private _metadataDB: JsonlDB<ValueMetadata> | undefined;
+	/** @internal */
+	public get metadataDB(): JsonlDB<ValueMetadata> | undefined {
+		return this._metadataDB;
+	}
+
+	public readonly configManager: ConfigManager;
+	public get configVersion(): string {
+		return (
+			this.configManager?.configVersion ??
+			packageJson?.dependencies?.["@zwave-js/config"] ??
+			libVersion
+		);
+	}
+
+	private _logContainer: ZWaveLogContainer;
+	private _driverLog: DriverLogger;
+	/** @internal */
+	public get driverLog(): DriverLogger {
+		return this._driverLog;
+	}
+
+	private _controllerLog: ControllerLogger;
+	/** @internal */
+	public get controllerLog(): ControllerLogger {
+		return this._controllerLog;
+	}
+
+	private _controller: ZWaveController | undefined;
+	/** Encapsulates information about the Z-Wave controller and provides access to its nodes */
+	public get controller(): ZWaveController {
+		if (this._controller == undefined) {
+			throw new ZWaveError(
+				"The controller is not yet ready!",
+				ZWaveErrorCodes.Driver_NotReady,
+			);
+		}
+		return this._controller;
+	}
+
+	private _securityManager: SecurityManager | undefined;
+	/** @internal */
+	public get securityManager(): SecurityManager | undefined {
+		return this._securityManager;
+	}
+
+	private _securityManager2: SecurityManager2 | undefined;
+	/** @internal */
+	public get securityManager2(): SecurityManager2 | undefined {
+		return this._securityManager2;
+	}
 
 	/** Updates the logging configuration without having to restart the driver. */
 	public updateLogConfig(config: DeepPartial<LogConfig>): void {
@@ -749,7 +768,9 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 
 			// Perform initialization sequence
 			await this.writeHeader(MessageHeaders.NAK);
-			await this.trySoftReset();
+			// Per the specs, this should be followed by a soft-reset but we need to be able
+			// to handle sticks that don't support the soft reset command. Therefore we do it
+			// after opening the value DBs
 
 			// Try to create the cache directory. This can fail, in which case we should expose a good error message
 			try {
@@ -866,6 +887,42 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 		return this._nodesReadyEventEmitted;
 	}
 
+	private async initValueDBs(homeId: number): Promise<void> {
+		// Always start the value and metadata databases
+		const options: JsonlDBOptions<any> = {
+			ignoreReadErrors: true,
+			...throttlePresets[this.options.storage.throttle],
+		};
+		if (this.options.storage.lockDir) {
+			options.lockfileDirectory = this.options.storage.lockDir;
+		}
+
+		const valueDBFile = path.join(
+			this.cacheDir,
+			`${homeId.toString(16)}.values.jsonl`,
+		);
+		this._valueDB = new JsonlDB(valueDBFile, {
+			...options,
+			reviver: (key, value) => deserializeCacheValue(value),
+			serializer: (key, value) => serializeCacheValue(value),
+		});
+		await this._valueDB.open();
+
+		const metadataDBFile = path.join(
+			this.cacheDir,
+			`${homeId.toString(16)}.metadata.jsonl`,
+		);
+		this._metadataDB = new JsonlDB(metadataDBFile, options);
+		await this._metadataDB.open();
+
+		if (process.env.NO_CACHE === "true") {
+			// Since value/metadata DBs are append-only, we need to clear them
+			// if the cache should be ignored
+			this._valueDB.clear();
+			this._metadataDB.clear();
+		}
+	}
+
 	/**
 	 * Initializes the variables for controller and nodes,
 	 * adds event handlers and starts the interview process.
@@ -878,52 +935,77 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 				.on("node removed", this.onNodeRemoved.bind(this));
 		}
 
-		const initValueDBs = async (): Promise<void> => {
-			// Always start the value and metadata databases
-			const options: JsonlDBOptions<any> = {
-				ignoreReadErrors: true,
-				...throttlePresets[this.options.storage.throttle],
-			};
-			if (this.options.storage.lockDir) {
-				options.lockfileDirectory = this.options.storage.lockDir;
-			}
-
-			const valueDBFile = path.join(
-				this.cacheDir,
-				`${this._controller!.homeId!.toString(16)}.values.jsonl`,
-			);
-			this._valueDB = new JsonlDB(valueDBFile, {
-				...options,
-				reviver: (key, value) => deserializeCacheValue(value),
-				serializer: (key, value) => serializeCacheValue(value),
-			});
-			await this._valueDB.open();
-
-			const metadataDBFile = path.join(
-				this.cacheDir,
-				`${this._controller!.homeId!.toString(16)}.metadata.jsonl`,
-			);
-			this._metadataDB = new JsonlDB(metadataDBFile, options);
-			await this._metadataDB.open();
-
-			if (process.env.NO_CACHE === "true") {
-				// Since value/metadata DBs are append-only, we need to clear them
-				// if the cache should be ignored
-				this._valueDB.clear();
-				this._metadataDB.clear();
-			}
-		};
-
 		if (!this.options.interview.skipInterview) {
+			// Determine controller IDs to open the Value DBs
+			// We need to do this first because some older controllers, especially the UZB1 and
+			// some 500-series sticks in virtualized environments don't respond after a soft reset
+
+			// No need to initialize databases if skipInterview is true, because it is only used in some
+			// Driver unit tests that don't need access to them
+
+			// Identify the controller and determine if it supports soft reset
+			await this.controller.identify();
+
+			if (this.options.enableSoftReset && !(await this.maySoftReset())) {
+				this.driverLog.print(
+					`Soft reset is enabled through config, but this stick does not support it.`,
+					"warn",
+				);
+				this.options.enableSoftReset = false;
+			}
+
+			if (this.options.enableSoftReset) {
+				try {
+					await this.softResetInternal(false);
+				} catch (e) {
+					if (
+						isZWaveError(e) &&
+						e.code === ZWaveErrorCodes.Driver_Failed
+					) {
+						// Remember that soft reset is not supported by this stick
+						await this.rememberNoSoftReset();
+						// Then fail the driver
+						await this.destroy();
+						return;
+					}
+				}
+			}
+
+			// There are situations where a controller claims it has the ID 0,
+			// which isn't valid. In this case try again after having soft-reset the stick
+			if (
+				this.controller.ownNodeId === 0 &&
+				this.options.enableSoftReset
+			) {
+				this.driverLog.print(
+					`Controller identification returned invalid node ID 0 - trying again...`,
+					"warn",
+				);
+				await this.controller.identify();
+			}
+
+			if (this.controller.ownNodeId === 0) {
+				this.driverLog.print(
+					`Controller identification returned invalid node ID 0`,
+					"error",
+				);
+				await this.destroy();
+				return;
+			}
+
+			// now that we know the home ID, we can open the databases
+			await this.initValueDBs(this.controller.homeId!);
+
 			// Interview the controller.
-			await this._controller.interview(initValueDBs, async () => {
+			await this._controller.interview(async () => {
 				// Try to restore the network information from the cache
 				if (process.env.NO_CACHE !== "true") {
 					await this.restoreNetworkStructureFromCache();
 				}
 			});
-			// No need to initialize databases if skipInterview is true, because it is only used in some
-			// Driver unit tests that don't need access to them
+
+			// Auto-enable smart start inclusion
+			this._controller.autoProvisionSmartStart();
 		}
 
 		// Set up the S0 security manager. We can only do that after the controller
@@ -1581,6 +1663,101 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 
 	private isSoftResetting: boolean = false;
 
+	private async maySoftReset(): Promise<boolean> {
+		// If we've previously determined a stick not to support soft reset, don't bother trying again
+		let supportsSoftReset: boolean | undefined;
+		if (this._controllerInterviewed) {
+			supportsSoftReset = this.controller.supportsSoftReset;
+		} else {
+			// The controller wasn't interviewed yet, read the json file manually
+			const fs = this.options.storage.driver;
+
+			const cacheFile = path.join(
+				this.cacheDir,
+				this.controller.homeId!.toString(16) + ".json",
+			);
+
+			// Read it if it exists
+			let json;
+			if (await fs.pathExists(cacheFile)) {
+				try {
+					json = JSON.parse(await fs.readFile(cacheFile, "utf8"));
+				} catch {}
+			}
+			supportsSoftReset = json?.controller?.supportsSoftReset;
+		}
+		if (supportsSoftReset === false) return false;
+
+		// Blacklist some sticks that are known to not support soft reset
+		const { manufacturerId, productType, productId } = this.controller;
+
+		// Z-Wave.me UZB1
+		if (
+			manufacturerId === 0x0115 &&
+			productType === 0x0000 &&
+			productId === 0x0000
+		) {
+			return false;
+		}
+
+		// Z-Wave.me UZB
+		if (
+			manufacturerId === 0x0115 &&
+			productType === 0x0400 &&
+			productId === 0x0001
+		) {
+			return false;
+		}
+
+		return true;
+	}
+
+	private async rememberNoSoftReset(): Promise<void> {
+		this.driverLog.print(
+			"Soft reset seems not to be supported by this stick, disabling it.",
+			"warn",
+		);
+		this.controller.supportsSoftReset = false;
+
+		if (this._controllerInterviewed) {
+			// We can use the normal method for this
+			await this.saveNetworkToCacheInternal();
+		} else {
+			// saveNetworkToCache won't write anything, just edit the file "manually"
+
+			// TODO: This is ugly, rework this when changing how the network data is saved
+
+			const fs = this.options.storage.driver;
+
+			await fs.ensureDir(this.cacheDir);
+			const cacheFile = path.join(
+				this.cacheDir,
+				this.controller.homeId!.toString(16) + ".json",
+			);
+
+			// Read it if it exists
+			let json;
+			if (await fs.pathExists(cacheFile)) {
+				try {
+					json = JSON.parse(await fs.readFile(cacheFile, "utf8"));
+				} catch {}
+			}
+
+			// Change the supportsSoftReset flag
+			json ??= {};
+			json.controller ??= {};
+			json.controller.supportsSoftReset = false;
+
+			// And save it again
+			const jsonString = stringify(json);
+			await this.options.storage.driver.writeFile(
+				cacheFile,
+				jsonString,
+				"utf8",
+			);
+		}
+	}
+
 	/**
 	 * Soft-resets the controller if the feature is enabled
 	 */
@@ -1610,7 +1787,11 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 			);
 		}
 
-		this.controllerLog.print("performing soft reset...");
+		return this.softResetInternal(true);
+	}
+
+	private async softResetInternal(destroyOnError: boolean): Promise<void> {
+		this.controllerLog.print("Performing soft reset...");
 
 		try {
 			this.isSoftResetting = true;
@@ -1618,9 +1799,6 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 				supportCheck: false,
 				pauseSendThread: true,
 			});
-
-			// TODO: This will cause the controller to issue a FUNC_ID_SERIAL_API_STARTED command
-			// We should react to that instead of waiting a fixed 1.5 seconds
 		} catch (e) {
 			this.controllerLog.print(
 				`Soft reset failed: ${getErrorMessage(e)}`,
@@ -1628,18 +1806,94 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 			);
 		}
 
-		// Wait 1.5 seconds after reset to ensure that the module is ready for communication again
-		await wait(1500);
-
-		// If the controller disconnected the serial port during the soft reset, we need to re-open it
-		if (!this.serial!.isOpen) {
-			await this.tryOpenSerialport();
+		// Make sure we're able to communicate with the controller again
+		if (!(await this.ensureSerialAPI())) {
+			if (destroyOnError) {
+				await this.destroy();
+			} else {
+				throw new ZWaveError(
+					"The Serial API did not respond after soft-reset",
+					ZWaveErrorCodes.Driver_Failed,
+				);
+			}
 		}
 
 		this.isSoftResetting = false;
 
 		// And resume sending
 		this.unpauseSendThread();
+	}
+
+	private async ensureSerialAPI(): Promise<boolean> {
+		// Wait 1.5 seconds after reset to ensure that the module is ready for communication again
+		// Z-Wave 700 sticks are relatively fast, so we also wait for the Serial API started command
+		// to bail early
+		this.controllerLog.print("Waiting for the controller to reconnect...");
+		let waitResult = await this.waitForMessage<SerialAPIStartedRequest>(
+			(msg) => msg.functionType === FunctionType.SerialAPIStarted,
+			1500,
+		).catch(() => false as const);
+
+		if (waitResult) {
+			// Serial API did start, maybe do something with the information?
+			this.controllerLog.print("reconnected and restarted");
+			return true;
+		}
+
+		// If the controller disconnected the serial port during the soft reset, we need to re-open it
+		if (!this.serial!.isOpen) {
+			this.controllerLog.print("Re-opening serial port...");
+			await this.tryOpenSerialport();
+		}
+
+		// Wait the configured amount of time for the Serial API started command to be received
+		this.controllerLog.print("Waiting for the Serial API to start...");
+		waitResult = await this.waitForMessage<SerialAPIStartedRequest>(
+			(msg) => msg.functionType === FunctionType.SerialAPIStarted,
+			this.options.timeouts.serialAPIStarted,
+		).catch(() => false as const);
+
+		if (waitResult) {
+			// Serial API did start, maybe do something with the information?
+			this.controllerLog.print("Serial API started");
+			return true;
+		}
+
+		this.controllerLog.print(
+			"Did not receive notification that Serial API has started, checking if it responds...",
+		);
+
+		// We don't need to use any specific command here. However we're going to use this one in the interview
+		// anyways, so we might aswell use it here too
+		const pollController = async () => {
+			try {
+				// And resume sending - this requires us to unpause the send thread
+				this.unpauseSendThread();
+				await this.sendMessage(new GetControllerVersionRequest(this), {
+					supportCheck: false,
+				});
+				this.pauseSendThread();
+				this.controllerLog.print("Serial API responded");
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		// Poll the controller with increasing backoff delay
+		if (await pollController()) return true;
+		for (const backoff of [2, 5, 10, 15]) {
+			this.controllerLog.print(
+				`Serial API did not respond, trying again in ${backoff} seconds...`,
+			);
+			await wait(backoff * 1000, true);
+			if (await pollController()) return true;
+		}
+
+		this.controllerLog.print(
+			"Serial API did not respond, giving up",
+			"error",
+		);
+		return false;
 	}
 
 	/**
@@ -1713,6 +1967,21 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 		this._destroyPromise = createDeferredPromise();
 
 		this.driverLog.print("destroying driver instance...");
+
+		// Disable inclusion before shutting down
+		try {
+			switch (this._controller?.inclusionState) {
+				case InclusionState.SmartStart:
+				case InclusionState.Including:
+					await this._controller.stopInclusionNoCallback();
+					break;
+				case InclusionState.Excluding:
+					await this._controller.stopExclusionNoCallback();
+					break;
+			}
+		} catch {
+			// ignore
+		}
 
 		// First stop the send thread machine and close the serial port, so nothing happens anymore
 		if (this.sendThread.initialized) this.sendThread.stop();
@@ -2071,15 +2340,44 @@ export class Driver extends TypedEventEmitter<DriverEventCallbacks> {
 					: "No SPAN is established yet";
 
 			if (this.controller.bootstrappingS2NodeId === nodeId) {
-				// The node is currently being bootstrapped. Us not being able to decode the command means we need to abort the bootstrapping process
-				this.controllerLog.logNode(nodeId, {
-					message: `${message}, cannot decode command. Aborting the S2 bootstrapping process...`,
-					level: "error",
-					direction: "inbound",
-				});
-				this.controller.cancelSecureBootstrapS2(
-					KEXFailType.BootstrappingCanceled,
-				);
+				// The node is currently being bootstrapped.
+				if (this.securityManager2?.tempKeys.has(nodeId)) {
+					// The DSK has been verified, so we should be able to decode this command.
+					// If this is the first attempt, we need to request a nonce first
+					if (
+						this.securityManager2.getSPANState(nodeId).type ===
+						SPANState.None
+					) {
+						this.controllerLog.logNode(nodeId, {
+							message: `${message}, cannot decode command. Requesting a nonce...`,
+							level: "verbose",
+							direction: "outbound",
+						});
+						// Send the node our nonce
+						node.commandClasses["Security 2"]
+							.sendNonce()
+							.catch(() => {
+								// Ignore errors
+							});
+					} else {
+						// Us repeatedly not being able to decode the command means we need to abort the bootstrapping process
+						// because the PIN is wrong
+						this.controllerLog.logNode(nodeId, {
+							message: `${message}, cannot decode command. Aborting the S2 bootstrapping process...`,
+							level: "error",
+							direction: "inbound",
+						});
+						this.controller.cancelSecureBootstrapS2(
+							KEXFailType.BootstrappingCanceled,
+						);
+					}
+				} else {
+					this.controllerLog.logNode(nodeId, {
+						message: `Ignoring KEXSet because the DSK has not been verified yet`,
+						level: "verbose",
+						direction: "inbound",
+					});
+				}
 			} else if (!this.hasPendingTransactions(isS2NonceReport)) {
 				this.controllerLog.logNode(nodeId, {
 					message: `${message}, cannot decode command. Requesting a nonce...`,
@@ -2703,6 +3001,60 @@ ${handlers.length} left`,
 					}
 
 					return;
+				}
+			} else if (
+				msg instanceof ApplicationUpdateRequestSmartStartHomeIDReceived
+			) {
+				// the controller is in Smart Start learn mode and a node requests inclusion via Smart Start
+				this.controllerLog.print(
+					"Received Smart Start inclusion request",
+				);
+
+				if (
+					this.controller.inclusionState !== InclusionState.Idle &&
+					this.controller.inclusionState !== InclusionState.SmartStart
+				) {
+					this.controllerLog.print(
+						"Controller is busy and cannot handle this inclusion request right now...",
+					);
+					return;
+				}
+
+				// Check if the node is on the provisioning list
+				const provisioningEntry = this.controller.provisioningList.find(
+					(entry) =>
+						nwiHomeIdFromDSK(dskFromString(entry.dsk)).equals(
+							msg.nwiHomeId,
+						),
+				);
+				if (!provisioningEntry) {
+					this.controllerLog.print(
+						"NWI Home ID not found in provisioning list, ignoring request...",
+					);
+					return;
+				}
+
+				this.controllerLog.print(
+					"NWI Home ID found in provisioning list, including node...",
+				);
+				try {
+					const result =
+						await this.controller.beginInclusionSmartStart(
+							provisioningEntry,
+						);
+					if (!result) {
+						this.controllerLog.print(
+							"Smart Start inclusion could not be started",
+							"error",
+						);
+					}
+				} catch (e) {
+					this.controllerLog.print(
+						`Smart Start inclusion could not be started: ${getErrorMessage(
+							e,
+						)}`,
+						"error",
+					);
 				}
 			}
 		} else {

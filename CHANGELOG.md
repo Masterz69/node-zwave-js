@@ -4,7 +4,53 @@
 <!--
 	Add placeholder for next release with `wip` snippet
 -->
-## __WORK IN PROGRESS__
+## 8.7.4 (2021-11-03)
+### Bugfixes
+* Fixed a crash that happened when determining the SDK version for certain protocol versions
+
+## 8.7.3 (2021-11-03)
+### Bugfixes
+* The node ID of an existing node is no longer unnecessarily stored when serializing the provisioning list
+* Fixed assignment of lifeline associations that only support node associations, even though multi channel associations are supported by the node
+* The SmartStart feature is now limited to Z-Wave SDK 6.81+. Support needs to be tested before using the feature.
+
+### Config file changes
+* Add HomeSeer HS-WX300 Switch
+* Add missing parameters for Telldus TZWP-102
+* Add fingerprint to NAS-WR01ZE
+
+## 8.7.2 (2021-11-02)
+### Bugfixes
+* When provisioning an already-included node, the provisioning entry now gets assigned the node ID immediately
+
+## 8.7.1 (2021-11-02)
+### Bugfixes
+* Fix auto-enabling SmartStart listening mode after an inclusion or exclusion
+
+## 8.7.0 (2021-11-01)
+### Features
+* Add support for SmartStart and S2-only inclusion through pre-provisioned security information
+* Expose a helper function to parse QR code strings into provisioning information
+
+### Bugfixes
+* During S2 bootstrapping, send the controller's public key immediately to keep the included node from timing out
+* Allow removing associations with invalid node IDs
+* When the controller reports its own ID as 0 on startup, repeat the controller identification after soft-reset or restart
+* Fix polling of `Fibaro CC`
+
+### Config file changes
+* Add Aeotec aërQ Humidity Sensor v2
+* Add support for Heltun HE-FT01, small fixes for HE-HT01
+* Delay manual refresh for Leviton DZS15
+* Treat Basic Set as event for Merten FunkTaster CONNECT
+* Fix reporting for Fibaro FGT001
+* Fix reporting for Fibaro FGS-223
+
+## 8.6.1 (2021-10-26)
+### Bugfixes
+* Try to detect if a Z-Wave stick is incompatible with soft-reset and automatically disable the functionality
+
+## 8.6.0 (2021-10-25)
 ### Features
 * Implemented and use soft reset command. If this causes problems, you can opt-out.
 * Implemented 700-series variant of NVM backup/restore
@@ -19,6 +65,8 @@
 * Emit `Driver_Failed` error when serial port errors
 * Better error when creating a multicast group with missing nodes
 * Security S2 bootstrapping is now aborted when an incorrect PIN is entered
+* Avoid queuing duplicate firmware fragments
+* Add additional 1s delay before verifying a value that has been set through the `setValue` API with a transition duration
 
 ### Config file changes
 * Add support for Heltun panels
@@ -32,6 +80,12 @@
 * Correct manufactuerID for Zooz ZAC36
 * Correct param 100 and preserve endpoints for ZMNHTD
 * Force notification idle reset for Vision Security ZP3103
+* Update lifeline config and parameters for Philio PAN06 v1
+* Add fingerprint `0x0200:0x1022` to Shenzhen Neo NAS-DS01Z
+* Add Fakro FVS Solar Powered Skylight
+* Tidy up Vitrum devices
+* Correct identification of Vision ZP3111-5
+* Remove endpoints from FGS-212
 
 ### Changes under the hood
 * `supportsZWavePlus` property was removed from config files and documentation

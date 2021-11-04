@@ -1,4 +1,4 @@
-import type { ValueChangeOptions, ValueID } from "@zwave-js/core";
+import type { Duration, ValueChangeOptions, ValueID } from "@zwave-js/core";
 import {
 	CommandClasses,
 	Maybe,
@@ -82,6 +82,11 @@ export function throwWrongValueType(
 	);
 }
 
+export interface SchedulePollOptions {
+	duration?: Duration;
+	transition?: "fast" | "slow";
+}
+
 /**
  * The base class for all CC APIs exposed via `Node.commandClasses.<CCName>`
  * @publicAPI
@@ -128,8 +133,17 @@ export class CCAPI {
 	 */
 	protected schedulePoll(
 		property: ValueIDProperties,
-		timeoutMs: number = this.driver.options.timeouts.refreshValue,
+		{ duration, transition = "slow" }: SchedulePollOptions = {},
 	): boolean {
+		// Figure out the delay. If a non-zero duration was given or this is a "fast" transition,
+		// use/add the short delay. Otherwise, default to the long delay.
+		const durationMs = duration?.toMilliseconds() ?? 0;
+		const additionalDelay =
+			!!durationMs || transition === "fast"
+				? this.driver.options.timeouts.refreshValueAfterTransition
+				: this.driver.options.timeouts.refreshValue;
+		const timeoutMs = durationMs + additionalDelay;
+
 		if (this.isSinglecast()) {
 			const node = this.endpoint.getNodeUnsafe();
 			if (!node) return false;
@@ -362,6 +376,8 @@ export type CCToName<CC extends CommandClasses> = [CC] extends [
 	? "Node Naming and Location"
 	: [CC] extends [typeof CommandClasses["Notification"]]
 	? "Notification"
+	: [CC] extends [typeof CommandClasses["Powerlevel"]]
+	? "Powerlevel"
 	: [CC] extends [typeof CommandClasses["Protection"]]
 	? "Protection"
 	: [CC] extends [typeof CommandClasses["Scene Activation"]]
@@ -449,6 +465,7 @@ export interface CCAPIs {
 	"No Operation": import("./NoOperationCC").NoOperationCCAPI;
 	"Node Naming and Location": import("./NodeNamingCC").NodeNamingAndLocationCCAPI;
 	Notification: import("./NotificationCC").NotificationCCAPI;
+	Powerlevel: import("./PowerlevelCC").PowerlevelCCAPI;
 	Protection: import("./ProtectionCC").ProtectionCCAPI;
 	"Scene Activation": import("./SceneActivationCC").SceneActivationCCAPI;
 	"Scene Actuator Configuration": import("./SceneActuatorConfigurationCC").SceneActuatorConfigurationCCAPI;

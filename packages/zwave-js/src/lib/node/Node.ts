@@ -11,7 +11,10 @@ import {
 	CommandClasses,
 	CommandClassInfo,
 	CRC16_CCITT,
+	dskFromString,
+	dskToString,
 	getCCName,
+	getNodeMetaValueID,
 	isTransmissionError,
 	isZWaveError,
 	Maybe,
@@ -53,6 +56,7 @@ import { padStart } from "alcalzone-shared/strings";
 import { isArray, isObject } from "alcalzone-shared/typeguards";
 import { randomBytes } from "crypto";
 import { EventEmitter } from "events";
+import { PowerlevelCCTestNodeReport } from "../commandclass";
 import type {
 	CCAPI,
 	PollValueImplementation,
@@ -83,6 +87,7 @@ import {
 	FirmwareUpdateCapabilities,
 	FirmwareUpdateMetaDataCC,
 	FirmwareUpdateMetaDataCCGet,
+	FirmwareUpdateMetaDataCCReport,
 	FirmwareUpdateMetaDataCCStatusReport,
 	FirmwareUpdateRequestStatus,
 	FirmwareUpdateStatus,
@@ -110,6 +115,7 @@ import {
 	NotificationCC,
 	NotificationCCReport,
 } from "../commandclass/NotificationCC";
+import { Powerlevel, PowerlevelTestStatus } from "../commandclass/PowerlevelCC";
 import { SceneActivationCCSet } from "../commandclass/SceneActivationCC";
 import {
 	Security2CCNonceGet,
@@ -170,14 +176,6 @@ import type {
 	ZWaveNodeValueEventCallbacks,
 } from "./Types";
 import { InterviewStage, NodeStatus, NodeType, ProtocolVersion } from "./Types";
-
-/** Returns a Value ID that can be used to store node specific data without relating it to a CC */
-function getNodeMetaValueID(property: string): ValueID {
-	return {
-		commandClass: CommandClasses._NONE,
-		property,
-	};
-}
 
 export interface ZWaveNode
 	extends TypedEventEmitter<
@@ -502,6 +500,19 @@ export class ZWaveNode extends Endpoint implements SecurityClassOwner {
 
 	/** @internal */
 	public readonly securityClasses = new Map<SecurityClass, boolean>();
+
+	private _dsk: Buffer | undefined;
+	/**
+	 * The device specific key (DSK) of this node in binary format.
+	 * This is only set if included with Security S2.
+	 */
+	public get dsk(): Buffer | undefined {
+		return this._dsk;
+	}
+	/** @internal */
+	public set dsk(value: Buffer | undefined) {
+		this._dsk = value;
+	}
 
 	/** Whether the node was granted at least one security class */
 	public get isSecure(): Maybe<boolean> {
@@ -2177,6 +2188,8 @@ protocol version:      ${this._protocolVersion}`;
 			return this.handleFirmwareUpdateStatusReport(command);
 		} else if (command instanceof EntryControlCCNotification) {
 			return this.handleEntryControlNotification(command);
+		} else if (command instanceof PowerlevelCCTestNodeReport) {
+			return this.handlePowerlevelTestNodeReport(command);
 		}
 
 		// Ignore all commands that don't need to be handled
@@ -3333,6 +3346,25 @@ protocol version:      ${this._protocolVersion}`;
 					await this.sendCorruptedFirmwareUpdateReport(num, fragment);
 					return;
 				} else {
+					// Avoid queuing duplicate fragments
+					const isCurrentFirmwareFragment = (t: Transaction) =>
+						t.message.getNodeId() === this.nodeId &&
+						isCommandClassContainer(t.message) &&
+						t.message.command instanceof
+							FirmwareUpdateMetaDataCCReport &&
+						t.message.command.reportNumber === num;
+					if (
+						this.driver.hasPendingTransactions(
+							isCurrentFirmwareFragment,
+						)
+					) {
+						this.driver.controllerLog.logNode(this.id, {
+							message: `Firmware fragment ${num} already queued`,
+							level: "warn",
+						});
+						continue;
+					}
+
 					this.driver.controllerLog.logNode(this.id, {
 						message: `Sending firmware fragment ${num} / ${numFragments}`,
 						direction: "outbound",
@@ -3507,6 +3539,18 @@ protocol version:      ${this._protocolVersion}`;
 		);
 	}
 
+	private handlePowerlevelTestNodeReport(
+		command: PowerlevelCCTestNodeReport,
+	): void {
+		// Notify listeners
+		this.emit(
+			"notification",
+			this,
+			CommandClasses.Powerlevel,
+			pick(command, ["testNodeId", "status", "acknowledgedFrames"]),
+		);
+	}
+
 	/**
 	 * @internal
 	 * Serializes this node in order to store static data in a cache
@@ -3532,6 +3576,7 @@ protocol version:      ${this._protocolVersion}`;
 			supportsSecurity: this.supportsSecurity,
 			supportsBeaming: this.supportsBeaming,
 			securityClasses: {} as JSONObject,
+			dsk: this.dsk ? dskToString(this.dsk) : undefined,
 			commandClasses: {} as JSONObject,
 		};
 		// Save security classes where they are known
@@ -3639,6 +3684,13 @@ protocol version:      ${this._protocolVersion}`;
 			this.securityClasses.set(SecurityClass.S2_AccessControl, false);
 			this.securityClasses.set(SecurityClass.S2_Authenticated, false);
 			this.securityClasses.set(SecurityClass.S2_Unauthenticated, false);
+		}
+		if (typeof obj.dsk === "string") {
+			try {
+				this._dsk = dskFromString(obj.dsk);
+			} catch {
+				// ignore
+			}
 		}
 		tryParse("supportsSecurity", "boolean");
 		tryParse("supportsBeaming", "boolean");
@@ -3862,5 +3914,80 @@ protocol version:      ${this._protocolVersion}`;
 
 		this.isSendingNoMoreInformation = false;
 		return msgSent;
+	}
+
+	/**
+	 * Instructs the node to send powerlevel test frames to the other node using the given powerlevel. Returns how many frames were acknowledged during the test.
+	 *
+	 * **Note:** Depending on the number of test frames, this may take a while
+	 */
+	public async testPowerlevel(
+		testNodeId: number,
+		powerlevel: Powerlevel,
+		testFrameCount: number,
+		onProgress?: (acknowledged: number, total: number) => void,
+	): Promise<number> {
+		const api = this.commandClasses.Powerlevel;
+
+		// Keep sleeping nodes awake
+		const wasKeptAwake = this.keepAwake;
+		if (this.canSleep) this.keepAwake = true;
+		const result = <T>(value: T) => {
+			// And undo the change when we're done
+			this.keepAwake = wasKeptAwake;
+			return value;
+		};
+
+		// Start the process
+		await api.startNodeTest(testNodeId, powerlevel, testFrameCount);
+
+		// Each frame will take a few ms to be sent, let's assume 5 per second
+		// to estimate how long the test will take
+		const expectedDurationMs = Math.round((testFrameCount / 5) * 1000);
+
+		// Poll the status of the test regularly
+		const pollFrequencyMs =
+			expectedDurationMs >= 60000
+				? 10000
+				: expectedDurationMs >= 10000
+				? 5000
+				: 1000;
+
+		let continuousErrors = 0;
+		while (true) {
+			// The node might send an unsolicited update when it finishes the test
+			const report = await this.driver
+				.waitForCommand<PowerlevelCCTestNodeReport>(
+					(cc) =>
+						cc.nodeId === this.id &&
+						cc instanceof PowerlevelCCTestNodeReport,
+					pollFrequencyMs,
+				)
+				.catch(() => undefined);
+
+			const status = report
+				? pick(report, ["status", "acknowledgedFrames"])
+				: // If it didn't come in the wait time, poll for an update
+				  await api.getNodeTestStatus().catch(() => undefined);
+
+			// If we didn't get a result, try again next iteration
+			if (!status) {
+				// Safeguard against infinite loop
+				if (continuousErrors > 5) return result(0);
+				continuousErrors++;
+				continue;
+			} else {
+				continuousErrors = 0;
+			}
+
+			if (status.status === PowerlevelTestStatus.Failed) {
+				return result(0);
+			} else if (status.status === PowerlevelTestStatus.Success) {
+				return result(status.acknowledgedFrames);
+			} else if (onProgress) {
+				// Notify the caller of the test progress
+				onProgress(status.acknowledgedFrames, testFrameCount);
+			}
+		}
 	}
 }

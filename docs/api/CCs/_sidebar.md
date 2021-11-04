@@ -18,6 +18,7 @@
     -   [Virtual nodes and endpoints](api/virtual-node-endpoint.md)
     -   [Values and Metadata](api/valueid.md)
     -   [ConfigManager](api/config-manager.md)
+    -   [Utilities](api/utils.md)
     -   [Command Classes](api/CCs/index.md)
 
         -   [Alarm Sensor CC](api/CCs/AlarmSensor.md)
@@ -51,6 +52,7 @@
         -   [Node Naming and Location CC](api/CCs/NodeNamingAndLocation.md)
         -   [No Operation CC](api/CCs/NoOperation.md)
         -   [Notification CC](api/CCs/Notification.md)
+        -   [Powerlevel CC](api/CCs/Powerlevel.md)
         -   [Protection CC](api/CCs/Protection.md)
         -   [Scene Activation CC](api/CCs/SceneActivation.md)
         -   [Scene Actuator Configuration CC](api/CCs/SceneActuatorConfiguration.md)

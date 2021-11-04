@@ -137,6 +137,8 @@ export enum ZWaveErrorCodes {
 	Security2CC_MissingExtension,
 	/** Gets thrown when a Security S2 encapsulated command cannot be decoded by the target node */
 	Security2CC_CannotDecode,
+	/** Gets thrown when parsing an invalid QR code */
+	Security2CC_InvalidQRCode,
 
 	/** The firmware update process is already active */
 	FirmwareUpdateCC_Busy = 1500,
@@ -155,6 +157,9 @@ export enum ZWaveErrorCodes {
 	Invalid_Firmware_File,
 	/** An firmware file with an unsupported format was provided */
 	Unsupported_Firmware_Format,
+
+	/** Unsupported target node for a powerlevel test */
+	PowerlevelCC_UnsupportedTestNode = 1600,
 }
 
 export function getErrorSuffix(code: ZWaveErrorCodes): string {
