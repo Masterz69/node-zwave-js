@@ -57,9 +57,6 @@ export interface ZWaveOptions {
 		/** How often the driver should try sending SendData commands before giving up */
 		sendData: number; // [1...5], default: 3
 
-		/** Whether a command should be retried when a node acknowledges the receipt but no response is received */
-		retryAfterTransmitReport: boolean; // default: false
-
 		/**
 		 * How many attempts should be made for each node interview before giving up
 		 */
@@ -147,6 +144,17 @@ export interface ZWaveOptions {
 	 * Default: `false`
 	 */
 	disableOptimisticValueUpdate?: boolean;
+
+	/**
+	 * By default, the driver assumes to be talking to a single application. In this scenario a successful `setValue` call
+	 * is enough for the application to know that the value was changed and update its own cache or UI.
+	 *
+	 * Therefore, the `"value updated"` event is not emitted after `setValue` unless the change was verified by the device.
+	 * To get `"value updated"` events nonetheless, set this option to `true`.
+	 *
+	 * Default: `false`
+	 */
+	emitValueUpdateAfterSetValue?: boolean;
 
 	/**
 	 * Soft Reset is required after some commands like changing the RF region or restoring an NVM backup.
